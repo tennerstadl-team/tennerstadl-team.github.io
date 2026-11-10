@@ -19,10 +19,18 @@ iframe{display:block;width:100%;height:100%;border:0;margin:0;background:#000}
 #off{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:30px}
 #off img{width:120px;height:120px;border-radius:50%;margin-bottom:18px}
 #off button{margin-top:18px;padding:12px 22px;border-radius:12px;border:1px solid #fff;background:none;color:#fff;font:inherit}
+/* v4.3 Mitteilungen: eigener Knopf auf der Seite selbst (iOS erlaubt die Abfrage nur nach einem Tipp hier, nicht im iFrame) */
+#pa{position:fixed;inset:0;display:none;align-items:flex-end;justify-content:center;background:rgba(0,0,0,.55);padding:16px;padding-bottom:calc(16px + env(safe-area-inset-bottom))}
+#pa div{width:100%;max-width:420px;background:#fff;color:#111;border-radius:18px;padding:20px;text-align:center}
+#pa b{display:block;font-size:18px;margin-bottom:6px}
+#pa p{margin:0 0 16px;color:#555;font-size:14.5px;line-height:1.4}
+#pa button{display:block;width:100%;padding:13px;border-radius:12px;border:0;font-family:inherit;font-size:16px;font-weight:600;margin-top:8px}
+#pa .y{background:#111;color:#fff}#pa .n{background:#eee;color:#111}
 </style>
 </head>
 <body>
 <iframe id="app" title="TENN Team-App" allow="clipboard-write"></iframe>
+<div id="pa" role="dialog" aria-modal="true"><div><b>🔔 Mitteilungen erlauben</b><p id="pat">Tippe auf „Erlauben“ und bestätige danach die Abfrage vom Handy.</p><button class="y" id="pay">Erlauben</button><button class="n" id="pan">Abbrechen</button></div></div>
 <div id="off"><img src="icon-192.png" alt=""><b>Keine Verbindung</b><span style="color:#aaa;margin-top:6px">Bitte Internet prüfen.</span><button onclick="location.reload()">Nochmal versuchen</button></div>
 <script>
 // ===== NUR DIESE ZEILE ÄNDERN, wenn es einmal eine neue Web-App-Adresse gibt (endet auf /exec) =====
@@ -35,13 +43,77 @@ var OK = /^https:\/\/[a-z0-9-]+-script\.googleusercontent\.com$/;
 window.addEventListener('message', function (ev) {
   var m = ev.data;
   if (!m || m.tenn !== 1 || !OK.test(ev.origin) || !ev.source) return;
+  APP.win = ev.source; APP.origin = ev.origin;
   if (m.type === 'get') {
     var t = ''; try { t = localStorage.getItem('tenn_token') || ''; } catch (e) {}
-    ev.source.postMessage({ tenn: 1, type: 'token', token: t }, ev.origin);
+    ev.source.postMessage({ tenn: 1, type: 'token', token: t, go: takeGo() }, ev.origin);
   } else if (m.type === 'set') {
     try { if (m.token) localStorage.setItem('tenn_token', String(m.token)); else localStorage.removeItem('tenn_token'); } catch (e) {}
-  }
+  } else if (m.type === 'push-get') pushGet(m);
+  else if (m.type === 'push-enable') pushAsk(m);
+  else if (m.type === 'push-disable') withOS(function (OS) { return OS.User.PushSubscription.optOut().then(function () { pushState(OS, 'disabled'); }); });
+  else if (m.type === 'push-logout') withOS(function (OS) { return OS.logout(); });
 });
+
+// ===== Mitteilungen (v4.3, OneSignal Web Push – gratis) =====
+// App-ID kommt aus der App (Script-Property ONESIGNAL_APP_ID) und wird hier gemerkt – hier muss nichts eingetragen werden.
+// OneSignal-Service-Worker liegt in /push/onesignal/ (eigener Bereich) → die bestehende sw.js (Bereich /) bleibt unberührt.
+var APP = { win: null, origin: '' }, OSP = null, OSO = null, PEND = null;
+function send(m) { if (APP.win) { m.tenn = 1; try { APP.win.postMessage(m, APP.origin); } catch (e) {} } }
+function takeGo() { var g = (location.hash || '').replace('#', ''); if (g) try { history.replaceState(null, '', location.pathname); } catch (e) {} return /^[a-z]{2,10}$/.test(g) ? g : ''; }
+window.addEventListener('hashchange', function () { var g = takeGo(); if (g) send({ type: 'go', go: g }); });
+function isIOS() { return /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); }
+function standalone() { return navigator.standalone === true || matchMedia('(display-mode: standalone)').matches || matchMedia('(display-mode: fullscreen)').matches; }
+function canPush() { return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window; }
+function loadOS(appId) {
+  if (OSP) return OSP;
+  OSP = new Promise(function (res, rej) {
+    window.OneSignalDeferred = window.OneSignalDeferred || [];
+    window.OneSignalDeferred.push(function (OS) {
+      return OS.init({ appId: appId, serviceWorkerPath: 'push/onesignal/OneSignalSDKWorker.js', serviceWorkerParam: { scope: '/push/onesignal/' },
+        notifyButton: { enable: false }, autoResubscribe: true }).then(function () { OSO = OS; res(OS); }, rej);
+    });
+    var s = document.createElement('script'); s.src = 'https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js'; s.defer = true;
+    s.onerror = function () { OSP = null; rej(new Error('OneSignal nicht erreichbar')); };
+    document.head.appendChild(s);
+  });
+  return OSP;
+}
+function withOS(fn) { if (OSP) OSP.then(fn).catch(function (e) { pushState(null, 'error', e); }); }
+function pushState(OS, ev, err) {
+  var st = { type: 'push-state', ios: isIOS(), standalone: standalone(), supported: canPush(),
+    permission: 'Notification' in window ? Notification.permission : 'unsupported', subscribed: false, event: ev || '' };
+  if (err) st.error = String(err && err.message || err).slice(0, 120);
+  if (OS) try { st.supported = OS.Notifications.isPushSupported(); st.subscribed = !!(OS.Notifications.permission && OS.User.PushSubscription.optedIn); } catch (e) {}
+  send(st);
+}
+function pushGet(m) {
+  if (!canPush() || !m.appId) return pushState(null);
+  try { localStorage.setItem('tenn_os_app', m.appId); } catch (e) {}
+  loadOS(m.appId).then(function (OS) {
+    // schon erlaubt → Gerät dem (evtl. neu angemeldeten) Mitarbeiter zuordnen
+    if (OS.Notifications.permission && m.id && OS.User.externalId !== m.id) return OS.login(m.id).then(function () { return OS; });
+    return OS;
+  }).then(function (OS) { pushState(OS); }, function (e) { pushState(null, 'error', e); });
+}
+function pushAsk(m) {
+  if (!canPush()) return pushState(null);
+  PEND = m; var y = document.getElementById('pay');
+  y.disabled = true; y.textContent = 'Lädt …';
+  document.getElementById('pa').style.display = 'flex';
+  loadOS(m.appId).then(function () { y.disabled = false; y.textContent = 'Erlauben'; }, function (e) { document.getElementById('pa').style.display = 'none'; pushState(null, 'error', e); });
+}
+document.getElementById('pan').onclick = function () { document.getElementById('pa').style.display = 'none'; PEND = null; };
+document.getElementById('pay').onclick = function () {
+  var m = PEND, OS = OSO; document.getElementById('pa').style.display = 'none'; if (!m || !OS) return;
+  Promise.resolve(OS.Notifications.requestPermission())   // synchron im Tipp → iOS zeigt die Abfrage
+    .then(function () { return OS.login(m.id); })
+    .then(function () { if (OS.Notifications.permission && !OS.User.PushSubscription.optedIn) return OS.User.PushSubscription.optIn(); })
+    .then(function () { pushState(OS, OS.Notifications.permission ? 'enabled' : (Notification.permission === 'denied' ? 'denied' : '')); })
+    .catch(function (e) { pushState(OS, 'error', e); });
+};
+// Schon eingerichtet → OneSignal gleich beim Start laden (hält das Abo frisch)
+try { var _a = localStorage.getItem('tenn_os_app'); if (_a && canPush()) loadOS(_a).catch(function () {}); } catch (e) {}
 if (navigator.onLine === false) document.getElementById('off').style.display = 'flex';
 else document.getElementById('app').src = APP_URL;
 window.addEventListener('online', function () { if (!document.getElementById('app').src) location.reload(); });
